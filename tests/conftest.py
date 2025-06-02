@@ -1,91 +1,76 @@
 """
-Test configuration and utilities.
+Test configuration and fixtures for the Notion-Slack AI Agent tests.
 """
-
 import pytest
 import asyncio
-from typing import Generator, AsyncGenerator
+from typing import Generator
+from unittest.mock import Mock, patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
-from unittest.mock import Mock, AsyncMock
 
 from src.main import app
 from src.models.database import Base, get_db
-from src.models.models import create_all_tables
+from src.models.schemas import User, UserPreferences
 from src.config import Settings, get_settings
 
-# Test database URL (use SQLite for testing)
+# Test database URL (in-memory SQLite)
 TEST_DATABASE_URL = "sqlite:///./test.db"
 
-# Test settings
-class TestSettings(Settings):
-    """Test-specific settings."""
-    database_url: str = TEST_DATABASE_URL
-    debug: bool = True
-    testing: bool = True
-    metrics_enabled: bool = False
-    
-    # Use mock API keys for testing
-    openai_api_key: str = "test-openai-key"
-    notion_integration_token: str = "test-notion-token"
-    slack_bot_token: str = "test-slack-token"
-    slack_signing_secret: str = "test-slack-secret"
-    api_secret_key: str = "test-secret-key"
+# Create test engine
+test_engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
+
+# Test session factory
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an instance of the default event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
+    loop = asyncio.new_event_loop()
     yield loop
     loop.close()
 
-@pytest.fixture(scope="session")
-def test_settings():
-    """Provide test settings."""
-    return TestSettings()
-
-@pytest.fixture(scope="session")
-def test_engine(test_settings):
-    """Create a test database engine."""
-    engine = create_engine(
-        test_settings.database_url,
-        connect_args={"check_same_thread": False}
-    )
-    return engine
-
-@pytest.fixture(scope="session")
-def test_db_session(test_engine):
-    """Create test database session."""
-    # Create all tables
+@pytest.fixture(scope="function")
+def db_session():
+    """Create a test database session."""
+    # Create tables
     Base.metadata.create_all(bind=test_engine)
     
-    TestingSessionLocal = sessionmaker(
-        autocommit=False, 
-        autoflush=False, 
-        bind=test_engine
-    )
-    
-    yield TestingSessionLocal
-
-    # Clean up
-    Base.metadata.drop_all(bind=test_engine)
-
-@pytest.fixture
-def db_session(test_db_session):
-    """Provide a database session for tests."""
-    session = test_db_session()
+    session = TestingSessionLocal()
     try:
         yield session
     finally:
-        session.rollback()
         session.close()
+        # Drop tables after each test
+        Base.metadata.drop_all(bind=test_engine)
 
-@pytest.fixture
-def client(test_settings, db_session):
+@pytest.fixture(scope="function")
+def test_settings():
+    """Create test settings."""
+    return Settings(
+        environment="test",
+        debug=True,
+        database_url=TEST_DATABASE_URL,
+        api_secret_key="test_secret_key_12345678901234567890",
+        openai_api_key="test_openai_key",
+        notion_integration_token="test_notion_token",
+        slack_bot_token="test_slack_token",
+        slack_signing_secret="test_slack_secret",
+        notion_webhook_secret="test_notion_webhook_secret",
+        redis_url="redis://localhost:6379/1"  # Use different DB for tests
+    )
+
+@pytest.fixture(scope="function")
+def client(db_session, test_settings):
     """Create a test client."""
     def override_get_db():
-        yield db_session
+        try:
+            yield db_session
+        finally:
+            pass
     
     def override_get_settings():
         return test_settings
@@ -96,115 +81,142 @@ def client(test_settings, db_session):
     with TestClient(app) as test_client:
         yield test_client
     
-    # Clean up overrides
+    # Clean up
     app.dependency_overrides.clear()
 
 @pytest.fixture
+def test_user(db_session):
+    """Create a test user."""
+    user = User(
+        slack_user_id="U1234567890",
+        slack_team_id="T1234567890",
+        email="test@example.com",
+        display_name="Test User",
+        real_name="Test User",
+        is_active=True,
+        is_admin=False
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+@pytest.fixture
+def test_admin_user(db_session):
+    """Create a test admin user."""
+    user = User(
+        slack_user_id="U0987654321",
+        slack_team_id="T1234567890",
+        email="admin@example.com",
+        display_name="Admin User",
+        real_name="Admin User",
+        is_active=True,
+        is_admin=True
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+@pytest.fixture
 def mock_notion_client():
-    """Mock Notion client for testing."""
-    mock_client = Mock()
-    
-    # Mock common Notion API responses
-    mock_client.pages.create.return_value = {
-        "id": "test-page-id",
-        "url": "https://notion.so/test-page",
-        "properties": {}
-    }
-    
-    mock_client.pages.retrieve.return_value = {
-        "id": "test-page-id",
-        "properties": {},
-        "url": "https://notion.so/test-page"
-    }
-    
-    mock_client.databases.query.return_value = {
-        "results": [
-            {
-                "id": "test-page-id",
-                "properties": {},
-                "url": "https://notion.so/test-page",
-                "created_time": "2023-01-01T00:00:00.000Z",
-                "last_edited_time": "2023-01-01T00:00:00.000Z"
-            }
-        ]
-    }
-    
-    mock_client.search.return_value = {
-        "results": [
-            {
-                "id": "test-page-id",
-                "object": "page",
-                "url": "https://notion.so/test-page"
-            }
-        ]
-    }
-    
-    return mock_client
+    """Mock Notion client."""
+    with patch("src.tools.notion_tools.NotionClient") as mock:
+        mock_instance = Mock()
+        mock.return_value = mock_instance
+        
+        # Configure mock responses
+        mock_instance.pages.create.return_value = {
+            "id": "test_page_id",
+            "url": "https://notion.so/test_page",
+            "properties": {}
+        }
+        
+        mock_instance.databases.query.return_value = {
+            "results": [
+                {
+                    "id": "test_page_id",
+                    "properties": {"Name": {"title": [{"text": {"content": "Test Page"}}]}},
+                    "url": "https://notion.so/test_page",
+                    "created_time": "2023-01-01T00:00:00.000Z",
+                    "last_edited_time": "2023-01-01T00:00:00.000Z"
+                }
+            ]
+        }
+        
+        yield mock_instance
 
 @pytest.fixture
 def mock_slack_client():
-    """Mock Slack client for testing."""
-    mock_client = AsyncMock()
-    
-    # Mock common Slack API responses
-    mock_client.chat_postMessage.return_value = {
-        "ok": True,
-        "ts": "1234567890.123456",
-        "channel": "C1234567890"
-    }
-    
-    mock_client.conversations_info.return_value = {
-        "ok": True,
-        "channel": {
-            "id": "C1234567890",
-            "name": "general",
-            "is_private": False,
-            "num_members": 10
+    """Mock Slack client."""
+    with patch("src.tools.slack_tools.AsyncWebClient") as mock:
+        mock_instance = Mock()
+        mock.return_value = mock_instance
+        
+        # Configure mock responses
+        mock_instance.chat_postMessage.return_value = {
+            "ok": True,
+            "ts": "1234567890.123456",
+            "channel": "C1234567890"
         }
-    }
-    
-    mock_client.conversations_list.return_value = {
-        "ok": True,
-        "channels": [
-            {
+        
+        mock_instance.conversations_info.return_value = {
+            "ok": True,
+            "channel": {
                 "id": "C1234567890",
-                "name": "general",
+                "name": "test-channel",
                 "is_private": False,
-                "num_members": 10
-            }
-        ]
-    }
-    
-    mock_client.users_info.return_value = {
-        "ok": True,
-        "user": {
-            "id": "U1234567890",
-            "name": "testuser",
-            "real_name": "Test User",
-            "profile": {
-                "email": "test@example.com"
+                "num_members": 5,
+                "topic": {"value": "Test channel"},
+                "purpose": {"value": "For testing"}
             }
         }
-    }
-    
-    return mock_client
+        
+        yield mock_instance
 
 @pytest.fixture
-def mock_agent():
-    """Mock AI agent for testing."""
-    mock_agent = Mock()
-    
-    mock_response = Mock()
-    mock_response.content = "Test agent response"
-    mock_agent.run.return_value = mock_response
-    
-    return mock_agent
+def mock_redis():
+    """Mock Redis client."""
+    with patch("redis.from_url") as mock:
+        mock_instance = Mock()
+        mock.return_value = mock_instance
+        
+        # Configure mock responses
+        mock_instance.pipeline.return_value = mock_instance
+        mock_instance.execute.return_value = [None, 0, None, None]
+        mock_instance.zcard.return_value = 0
+        mock_instance.zrange.return_value = []
+        
+        yield mock_instance
 
 @pytest.fixture
-def sample_notion_page():
-    """Sample Notion page data for testing."""
+def sample_slack_event():
+    """Sample Slack event payload."""
     return {
-        "id": "test-page-id-123",
+        "token": "verification_token",
+        "team_id": "T1234567890",
+        "api_app_id": "A1234567890",
+        "event": {
+            "type": "app_mention",
+            "user": "U1234567890",
+            "text": "<@U0987654321> hello there",
+            "ts": "1234567890.123456",
+            "channel": "C1234567890",
+            "event_ts": "1234567890.123456"
+        },
+        "type": "event_callback",
+        "event_id": "Ev1234567890",
+        "event_time": 1234567890
+    }
+
+@pytest.fixture
+def sample_notion_webhook():
+    """Sample Notion webhook payload."""
+    return {
+        "object": "page",
+        "id": "test_page_id",
+        "created_time": "2023-01-01T00:00:00.000Z",
+        "last_edited_time": "2023-01-01T00:00:00.000Z",
         "properties": {
             "Name": {
                 "title": [
@@ -214,202 +226,54 @@ def sample_notion_page():
                         }
                     }
                 ]
-            },
-            "Status": {
-                "select": {
-                    "name": "In Progress"
-                }
             }
         },
-        "url": "https://notion.so/test-page-123",
-        "created_time": "2023-01-01T00:00:00.000Z",
-        "last_edited_time": "2023-01-01T01:00:00.000Z"
+        "url": "https://notion.so/test_page"
     }
 
 @pytest.fixture
-def sample_slack_event():
-    """Sample Slack event data for testing."""
-    return {
-        "type": "app_mention",
-        "event": {
-            "type": "app_mention",
-            "user": "U1234567890",
-            "text": "<@U0BOTUSER> create a task",
-            "ts": "1234567890.123456",
-            "channel": "C1234567890",
-            "thread_ts": None
-        },
-        "team_id": "T1234567890",
-        "api_app_id": "A1234567890",
-        "event_id": "Ev1234567890",
-        "event_time": 1234567890
-    }
-
-@pytest.fixture
-def api_headers(test_settings):
-    """Headers for API requests."""
+def auth_headers(test_settings):
+    """Create authentication headers for API tests."""
     return {
         "Authorization": f"Bearer {test_settings.api_secret_key}",
         "Content-Type": "application/json"
     }
 
-class TestDataFactory:
-    """Factory for creating test data."""
-    
-    @staticmethod
-    def create_agent_session_data(**kwargs):
-        """Create agent session test data."""
-        default_data = {
-            "session_id": "test-session-123",
-            "user_id": "U1234567890",
-            "channel_id": "C1234567890",
-            "context": {"test": True},
-            "metadata": {"test_mode": True}
-        }
-        default_data.update(kwargs)
-        return default_data
-    
-    @staticmethod
-    def create_workflow_config_data(**kwargs):
-        """Create workflow configuration test data."""
-        default_data = {
-            "name": "Test Workflow",
-            "workflow_type": "sync_notion_to_slack",
-            "source_config": {"database_id": "test-db-123"},
-            "target_config": {"channel_id": "C1234567890"},
-            "is_active": True
-        }
-        default_data.update(kwargs)
-        return default_data
-    
-    @staticmethod
-    def create_event_log_data(**kwargs):
-        """Create event log test data."""
-        default_data = {
-            "event_type": "agent_response",
-            "source": "agent",
-            "event_data": {"test": True},
-            "user_id": "U1234567890",
-            "session_id": "test-session-123"
-        }
-        default_data.update(kwargs)
-        return default_data
-    
-    @staticmethod
-    def create_user_mapping_data(**kwargs):
-        """Create user mapping test data."""
-        default_data = {
-            "slack_user_id": "U1234567890",
-            "notion_user_id": "notion-user-123",
-            "email": "test@example.com",
-            "display_name": "Test User"
-        }
-        default_data.update(kwargs)
-        return default_data
+class MockAgentResponse:
+    """Mock agent response for testing."""
+    def __init__(self, content: str = "Test response"):
+        self.content = content
 
-# Pytest markers
-pytestmark = pytest.mark.asyncio
+@pytest.fixture
+def mock_agent():
+    """Mock Agno agent."""
+    with patch("agno.agent.Agent") as mock:
+        mock_instance = Mock()
+        mock.return_value = mock_instance
+        mock_instance.run.return_value = MockAgentResponse()
+        yield mock_instance
 
-# Custom assertions
-def assert_api_response_success(response):
-    """Assert that an API response is successful."""
-    assert response.status_code in [200, 201], f"Expected success status, got {response.status_code}: {response.text}"
-    data = response.json()
-    assert data.get("success") is not False, f"Response indicates failure: {data}"
-
-def assert_api_response_error(response, expected_status=400):
-    """Assert that an API response is an error."""
-    assert response.status_code == expected_status, f"Expected status {expected_status}, got {response.status_code}"
-    data = response.json()
-    assert "error" in data or "detail" in data, f"Response should contain error information: {data}"
-
-def assert_notion_page_structure(page_data):
-    """Assert that page data has the expected Notion structure."""
-    assert "id" in page_data
-    assert "properties" in page_data
-    assert "url" in page_data
-
-def assert_slack_message_structure(message_data):
-    """Assert that message data has the expected Slack structure."""
-    assert "ts" in message_data
-    assert "channel" in message_data
-    assert "text" in message_data or "blocks" in message_data
-
-# Test utilities
-def create_test_api_key(db_session, **kwargs):
-    """Create a test API key in the database."""
-    from src.models.models import APIKeyModel
-    from src.services.auth_service import auth_service
-    
-    key_id, api_key = auth_service.generate_api_key()
-    key_hash = auth_service.hash_api_key(api_key)
-    
-    default_data = {
-        "key_id": key_id,
-        "key_hash": key_hash,
-        "name": "Test API Key",
-        "description": "For testing",
-        "permissions": ["*"],
-        "rate_limit": 1000,
-        "is_active": True
-    }
-    default_data.update(kwargs)
-    
-    api_key_model = APIKeyModel(**default_data)
-    db_session.add(api_key_model)
+# Helper functions for tests
+def create_test_database_record(db_session, model_class, **kwargs):
+    """Helper to create test database records."""
+    record = model_class(**kwargs)
+    db_session.add(record)
     db_session.commit()
-    db_session.refresh(api_key_model)
-    
-    return api_key_model, api_key
+    db_session.refresh(record)
+    return record
 
-async def wait_for_condition(condition_func, timeout=5.0, interval=0.1):
-    """Wait for a condition to become true."""
-    import time
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        if await condition_func() if asyncio.iscoroutinefunction(condition_func) else condition_func():
-            return True
-        await asyncio.sleep(interval)
-    
-    return False
+def assert_response_success(response, expected_status=200):
+    """Assert API response is successful."""
+    assert response.status_code == expected_status
+    data = response.json()
+    assert "success" in data
+    assert data["success"] is True
+    return data
 
-# Test decorators
-def skip_if_no_api_keys(func):
-    """Skip test if no API keys are configured."""
-    import os
-    
-    def wrapper(*args, **kwargs):
-        if not os.environ.get("OPENAI_API_KEY") and not kwargs.get("mock_api_keys"):
-            pytest.skip("No API keys configured for testing")
-        return func(*args, **kwargs)
-    
-    return wrapper
-
-def requires_database(func):
-    """Mark test as requiring a database."""
-    return pytest.mark.database(func)
-
-def requires_external_apis(func):
-    """Mark test as requiring external APIs."""
-    return pytest.mark.external_api(func)
-
-# Mock context managers
-class MockAgent:
-    """Mock agent context manager for testing."""
-    
-    def __init__(self, responses=None):
-        self.responses = responses or ["Mock agent response"]
-        self.call_count = 0
-    
-    async def __aenter__(self):
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
-    
-    def run(self, message):
-        response = Mock()
-        response.content = self.responses[self.call_count % len(self.responses)]
-        self.call_count += 1
-        return response
+def assert_response_error(response, expected_status=400):
+    """Assert API response contains error."""
+    assert response.status_code == expected_status
+    data = response.json()
+    if "success" in data:
+        assert data["success"] is False
+    return data
