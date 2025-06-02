@@ -1,424 +1,393 @@
 """
-Repository pattern implementation for database operations.
+Repository classes for database operations.
 """
-from typing import List, Optional, Dict, Any, Generic, TypeVar
+from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, desc, asc
 from datetime import datetime, timedelta
-import logging
 
-from .database import Base
-from .schemas import EventType, EventStatus, WorkflowType
+from .schemas import (
+    User, UserPreferences, AgentSession, NotionDatabase,
+    SlackWorkspace, WorkflowExecution, APIKey, SystemMetrics
+)
 
-logger = logging.getLogger(__name__)
-
-# Generic type for models
-ModelType = TypeVar("ModelType", bound=Base)
-CreateSchemaType = TypeVar("CreateSchemaType")
-UpdateSchemaType = TypeVar("UpdateSchemaType")
-
-class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
-    """Base repository with common CRUD operations."""
+class BaseRepository:
+    """Base repository with common database operations."""
     
-    def __init__(self, model: type[ModelType]):
-        self.model = model
+    def __init__(self, db: Session, model_class):
+        self.db = db
+        self.model = model_class
     
-    def get(self, db: Session, id: int) -> Optional[ModelType]:
-        """Get a single record by ID."""
-        return db.query(self.model).filter(self.model.id == id).first()
+    def get_by_id(self, id: int):
+        """Get record by ID."""
+        return self.db.query(self.model).filter(self.model.id == id).first()
     
-    def get_multi(
-        self, 
-        db: Session, 
-        skip: int = 0, 
-        limit: int = 100,
-        **filters
-    ) -> List[ModelType]:
-        """Get multiple records with pagination and filters."""
-        query = db.query(self.model)
-        
-        # Apply filters
-        for key, value in filters.items():
-            if hasattr(self.model, key) and value is not None:
-                query = query.filter(getattr(self.model, key) == value)
-        
-        return query.offset(skip).limit(limit).all()
+    def get_all(self, skip: int = 0, limit: int = 100):
+        """Get all records with pagination."""
+        return self.db.query(self.model).offset(skip).limit(limit).all()
     
-    def create(self, db: Session, obj_in: CreateSchemaType) -> ModelType:
-        """Create a new record."""
-        if hasattr(obj_in, 'model_dump'):
-            obj_data = obj_in.model_dump()
-        else:
-            obj_data = obj_in.dict()
-        
-        db_obj = self.model(**obj_data)
-        db.add(db_obj)
-        db.commit()
-        db.refresh(db_obj)
-        return db_obj
-    
-    def update(
-        self, 
-        db: Session, 
-        db_obj: ModelType, 
-        obj_in: UpdateSchemaType
-    ) -> ModelType:
-        """Update an existing record."""
-        if hasattr(obj_in, 'model_dump'):
-            update_data = obj_in.model_dump(exclude_unset=True)
-        else:
-            update_data = obj_in.dict(exclude_unset=True)
-        
-        for field, value in update_data.items():
-            if hasattr(db_obj, field):
-                setattr(db_obj, field, value)
-        
-        if hasattr(db_obj, 'updated_at'):
-            db_obj.updated_at = datetime.utcnow()
-        
-        db.commit()
-        db.refresh(db_obj)
-        return db_obj
-    
-    def delete(self, db: Session, id: int) -> Optional[ModelType]:
-        """Delete a record by ID."""
-        obj = db.query(self.model).get(id)
-        if obj:
-            db.delete(obj)
-            db.commit()
+    def create(self, **kwargs):
+        """Create new record."""
+        obj = self.model(**kwargs)
+        self.db.add(obj)
+        self.db.commit()
+        self.db.refresh(obj)
         return obj
     
-    def count(self, db: Session, **filters) -> int:
-        """Count records with optional filters."""
-        query = db.query(self.model)
-        
-        # Apply filters
-        for key, value in filters.items():
-            if hasattr(self.model, key) and value is not None:
-                query = query.filter(getattr(self.model, key) == value)
-        
-        return query.count()
+    def update(self, id: int, **kwargs):
+        """Update record by ID."""
+        obj = self.get_by_id(id)
+        if obj:
+            for key, value in kwargs.items():
+                setattr(obj, key, value)
+            obj.updated_at = datetime.utcnow()
+            self.db.commit()
+            self.db.refresh(obj)
+        return obj
+    
+    def delete(self, id: int):
+        """Delete record by ID."""
+        obj = self.get_by_id(id)
+        if obj:
+            self.db.delete(obj)
+            self.db.commit()
+        return obj
 
-class AgentSessionRepository(BaseRepository):
-    """Repository for agent session operations."""
+class UserRepository(BaseRepository):
+    """Repository for User operations."""
     
-    def __init__(self):
-        from .models import AgentSessionModel
-        super().__init__(AgentSessionModel)
+    def __init__(self, db: Session):
+        super().__init__(db, User)
     
-    def get_by_session_id(self, db: Session, session_id: str) -> Optional[ModelType]:
-        """Get session by session_id."""
-        return db.query(self.model).filter(
-            self.model.session_id == session_id
-        ).first()
-    
-    def get_active_sessions(self, db: Session) -> List[ModelType]:
-        """Get all active sessions."""
-        return db.query(self.model).filter(
-            self.model.is_active == True
-        ).all()
-    
-    def get_user_sessions(
-        self, 
-        db: Session, 
-        user_id: str, 
-        limit: int = 10
-    ) -> List[ModelType]:
-        """Get recent sessions for a user."""
-        return db.query(self.model).filter(
-            self.model.user_id == user_id
-        ).order_by(desc(self.model.last_activity)).limit(limit).all()
-    
-    def cleanup_inactive_sessions(
-        self, 
-        db: Session, 
-        hours: int = 24
-    ) -> int:
-        """Clean up sessions inactive for specified hours."""
-        cutoff_time = datetime.utcnow() - timedelta(hours=hours)
-        
-        count = db.query(self.model).filter(
-            self.model.last_activity < cutoff_time,
-            self.model.is_active == True
-        ).count()
-        
-        db.query(self.model).filter(
-            self.model.last_activity < cutoff_time,
-            self.model.is_active == True
-        ).update({"is_active": False})
-        
-        db.commit()
-        return count
-    
-    def update_activity(self, db: Session, session_id: str) -> Optional[ModelType]:
-        """Update last activity timestamp for a session."""
-        session = self.get_by_session_id(db, session_id)
-        if session:
-            session.last_activity = datetime.utcnow()
-            db.commit()
-            db.refresh(session)
-        return session
-
-class WorkflowConfigRepository(BaseRepository):
-    """Repository for workflow configuration operations."""
-    
-    def __init__(self):
-        from .models import WorkflowConfigModel
-        super().__init__(WorkflowConfigModel)
-    
-    def get_by_type(
-        self, 
-        db: Session, 
-        workflow_type: WorkflowType
-    ) -> List[ModelType]:
-        """Get workflows by type."""
-        return db.query(self.model).filter(
-            self.model.workflow_type == workflow_type
-        ).all()
-    
-    def get_active_workflows(self, db: Session) -> List[ModelType]:
-        """Get all active workflows."""
-        return db.query(self.model).filter(
-            self.model.is_active == True
-        ).all()
-    
-    def get_scheduled_workflows(self, db: Session) -> List[ModelType]:
-        """Get workflows that have schedule configuration."""
-        return db.query(self.model).filter(
-            self.model.is_active == True,
-            self.model.schedule_config.isnot(None)
-        ).all()
-    
-    def update_execution_stats(
-        self, 
-        db: Session, 
-        workflow_id: int, 
-        success: bool = True
-    ) -> Optional[ModelType]:
-        """Update execution statistics for a workflow."""
-        workflow = self.get(db, workflow_id)
-        if workflow:
-            workflow.last_executed = datetime.utcnow()
-            workflow.execution_count += 1
-            db.commit()
-            db.refresh(workflow)
-        return workflow
-
-class EventLogRepository(BaseRepository):
-    """Repository for event log operations."""
-    
-    def __init__(self):
-        from .models import EventLogModel
-        super().__init__(EventLogModel)
-    
-    def get_by_event_type(
-        self, 
-        db: Session, 
-        event_type: EventType,
-        limit: int = 100
-    ) -> List[ModelType]:
-        """Get events by type."""
-        return db.query(self.model).filter(
-            self.model.event_type == event_type
-        ).order_by(desc(self.model.timestamp)).limit(limit).all()
-    
-    def get_by_session(
-        self, 
-        db: Session, 
-        session_id: str,
-        limit: int = 100
-    ) -> List[ModelType]:
-        """Get events for a session."""
-        return db.query(self.model).filter(
-            self.model.session_id == session_id
-        ).order_by(desc(self.model.timestamp)).limit(limit).all()
-    
-    def get_by_user(
-        self, 
-        db: Session, 
-        user_id: str,
-        limit: int = 100
-    ) -> List[ModelType]:
-        """Get events for a user."""
-        return db.query(self.model).filter(
-            self.model.user_id == user_id
-        ).order_by(desc(self.model.timestamp)).limit(limit).all()
-    
-    def get_failed_events(
-        self, 
-        db: Session,
-        since: Optional[datetime] = None,
-        limit: int = 100
-    ) -> List[ModelType]:
-        """Get failed events."""
-        query = db.query(self.model).filter(
-            self.model.status == EventStatus.FAILED
-        )
-        
-        if since:
-            query = query.filter(self.model.timestamp >= since)
-        
-        return query.order_by(desc(self.model.timestamp)).limit(limit).all()
-    
-    def get_events_by_date_range(
-        self,
-        db: Session,
-        start_date: datetime,
-        end_date: datetime,
-        event_types: Optional[List[EventType]] = None
-    ) -> List[ModelType]:
-        """Get events within a date range."""
-        query = db.query(self.model).filter(
+    def get_by_slack_id(self, slack_user_id: str, slack_team_id: str) -> Optional[User]:
+        """Get user by Slack user ID and team ID."""
+        return self.db.query(User).filter(
             and_(
-                self.model.timestamp >= start_date,
-                self.model.timestamp <= end_date
+                User.slack_user_id == slack_user_id,
+                User.slack_team_id == slack_team_id
             )
-        )
-        
-        if event_types:
-            query = query.filter(self.model.event_type.in_(event_types))
-        
-        return query.order_by(desc(self.model.timestamp)).all()
-    
-    def get_performance_stats(
-        self,
-        db: Session,
-        since: Optional[datetime] = None
-    ) -> Dict[str, Any]:
-        """Get performance statistics."""
-        query = db.query(self.model)
-        
-        if since:
-            query = query.filter(self.model.timestamp >= since)
-        
-        events = query.all()
-        
-        if not events:
-            return {}
-        
-        # Calculate statistics
-        total_events = len(events)
-        successful_events = len([e for e in events if e.status == EventStatus.COMPLETED])
-        failed_events = len([e for e in events if e.status == EventStatus.FAILED])
-        
-        processing_times = [
-            e.processing_time_ms for e in events 
-            if e.processing_time_ms is not None
-        ]
-        
-        stats = {
-            "total_events": total_events,
-            "successful_events": successful_events,
-            "failed_events": failed_events,
-            "success_rate": successful_events / total_events if total_events > 0 else 0,
-        }
-        
-        if processing_times:
-            stats.update({
-                "avg_processing_time_ms": sum(processing_times) / len(processing_times),
-                "min_processing_time_ms": min(processing_times),
-                "max_processing_time_ms": max(processing_times),
-            })
-        
-        # Event type breakdown
-        event_type_counts = {}
-        for event in events:
-            event_type = event.event_type.value
-            event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
-        
-        stats["event_type_breakdown"] = event_type_counts
-        
-        return stats
-    
-    def cleanup_old_events(
-        self, 
-        db: Session, 
-        days: int = 30
-    ) -> int:
-        """Clean up events older than specified days."""
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
-        
-        count = db.query(self.model).filter(
-            self.model.timestamp < cutoff_date
-        ).count()
-        
-        db.query(self.model).filter(
-            self.model.timestamp < cutoff_date
-        ).delete()
-        
-        db.commit()
-        return count
-
-class UserMappingRepository(BaseRepository):
-    """Repository for user mapping operations."""
-    
-    def __init__(self):
-        from .models import UserMappingModel
-        super().__init__(UserMappingModel)
-    
-    def get_by_slack_user_id(
-        self, 
-        db: Session, 
-        slack_user_id: str
-    ) -> Optional[ModelType]:
-        """Get user mapping by Slack user ID."""
-        return db.query(self.model).filter(
-            self.model.slack_user_id == slack_user_id
         ).first()
     
-    def get_by_notion_user_id(
-        self, 
-        db: Session, 
-        notion_user_id: str
-    ) -> Optional[ModelType]:
-        """Get user mapping by Notion user ID."""
-        return db.query(self.model).filter(
-            self.model.notion_user_id == notion_user_id
-        ).first()
+    def get_by_email(self, email: str) -> Optional[User]:
+        """Get user by email."""
+        return self.db.query(User).filter(User.email == email).first()
     
-    def get_by_email(self, db: Session, email: str) -> Optional[ModelType]:
-        """Get user mapping by email."""
-        return db.query(self.model).filter(
-            self.model.email == email
-        ).first()
+    def get_active_users(self) -> List[User]:
+        """Get all active users."""
+        return self.db.query(User).filter(User.is_active == True).all()
     
-    def get_active_users(self, db: Session) -> List[ModelType]:
-        """Get all active user mappings."""
-        return db.query(self.model).filter(
-            self.model.is_active == True
+    def get_admins(self) -> List[User]:
+        """Get all admin users."""
+        return self.db.query(User).filter(
+            and_(User.is_admin == True, User.is_active == True)
         ).all()
     
-    def update_last_seen(
-        self, 
-        db: Session, 
-        slack_user_id: str
-    ) -> Optional[ModelType]:
-        """Update last seen timestamp for a user."""
-        user = self.get_by_slack_user_id(db, slack_user_id)
+    def update_last_seen(self, user_id: int):
+        """Update user's last seen timestamp."""
+        user = self.get_by_id(user_id)
         if user:
-            user.last_seen = datetime.utcnow()
-            db.commit()
-            db.refresh(user)
+            user.last_seen_at = datetime.utcnow()
+            self.db.commit()
         return user
     
-    def search_users(
-        self, 
-        db: Session, 
-        query: str,
-        limit: int = 20
-    ) -> List[ModelType]:
-        """Search users by display name or email."""
-        search_pattern = f"%{query}%"
-        return db.query(self.model).filter(
+    def search_users(self, query: str) -> List[User]:
+        """Search users by name or email."""
+        return self.db.query(User).filter(
             or_(
-                self.model.display_name.ilike(search_pattern),
-                self.model.email.ilike(search_pattern)
-            ),
-            self.model.is_active == True
-        ).limit(limit).all()
+                User.display_name.ilike(f"%{query}%"),
+                User.real_name.ilike(f"%{query}%"),
+                User.email.ilike(f"%{query}%")
+            )
+        ).all()
 
-# Repository instances (can be imported directly)
-agent_session_repo = AgentSessionRepository()
-workflow_config_repo = WorkflowConfigRepository()
-event_log_repo = EventLogRepository()
-user_mapping_repo = UserMappingRepository()
+class AgentSessionRepository(BaseRepository):
+    """Repository for AgentSession operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, AgentSession)
+    
+    def get_by_session_id(self, session_id: str) -> Optional[AgentSession]:
+        """Get session by session ID."""
+        return self.db.query(AgentSession).filter(
+            AgentSession.session_id == session_id
+        ).first()
+    
+    def get_user_sessions(self, user_id: int, active_only: bool = True) -> List[AgentSession]:
+        """Get all sessions for a user."""
+        query = self.db.query(AgentSession).filter(AgentSession.user_id == user_id)
+        if active_only:
+            query = query.filter(AgentSession.is_active == True)
+        return query.order_by(desc(AgentSession.last_activity)).all()
+    
+    def get_channel_sessions(self, channel_id: str, active_only: bool = True) -> List[AgentSession]:
+        """Get all sessions for a Slack channel."""
+        query = self.db.query(AgentSession).filter(AgentSession.channel_id == channel_id)
+        if active_only:
+            query = query.filter(AgentSession.is_active == True)
+        return query.order_by(desc(AgentSession.last_activity)).all()
+    
+    def update_activity(self, session_id: str, message_data: Dict[str, Any] = None):
+        """Update session activity and optionally add message."""
+        session = self.get_by_session_id(session_id)
+        if session:
+            session.last_activity = datetime.utcnow()
+            if message_data:
+                session.messages.append(message_data)
+                session.total_messages += 1
+            self.db.commit()
+        return session
+    
+    def cleanup_inactive_sessions(self, inactive_hours: int = 24):
+        """Mark sessions as inactive after specified hours."""
+        cutoff_time = datetime.utcnow() - timedelta(hours=inactive_hours)
+        self.db.query(AgentSession).filter(
+            and_(
+                AgentSession.last_activity < cutoff_time,
+                AgentSession.is_active == True
+            )
+        ).update({"is_active": False})
+        self.db.commit()
+
+class NotionDatabaseRepository(BaseRepository):
+    """Repository for NotionDatabase operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, NotionDatabase)
+    
+    def get_by_database_id(self, database_id: str) -> Optional[NotionDatabase]:
+        """Get database by Notion database ID."""
+        return self.db.query(NotionDatabase).filter(
+            NotionDatabase.database_id == database_id
+        ).first()
+    
+    def get_by_slack_channel(self, channel_id: str) -> List[NotionDatabase]:
+        """Get databases associated with a Slack channel."""
+        return self.db.query(NotionDatabase).filter(
+            NotionDatabase.slack_channel_id == channel_id
+        ).all()
+    
+    def get_auto_sync_databases(self) -> List[NotionDatabase]:
+        """Get databases with auto-sync enabled."""
+        return self.db.query(NotionDatabase).filter(
+            NotionDatabase.auto_sync_enabled == True
+        ).all()
+    
+    def get_user_databases(self, user_id: int) -> List[NotionDatabase]:
+        """Get databases accessible to a user."""
+        return self.db.query(NotionDatabase).filter(
+            or_(
+                NotionDatabase.created_by_user_id == user_id,
+                NotionDatabase.is_public == True,
+                NotionDatabase.allowed_users.contains([user_id])
+            )
+        ).all()
+    
+    def update_sync_time(self, database_id: str):
+        """Update last sync timestamp."""
+        db_record = self.get_by_database_id(database_id)
+        if db_record:
+            db_record.last_sync_at = datetime.utcnow()
+            self.db.commit()
+        return db_record
+
+class WorkflowExecutionRepository(BaseRepository):
+    """Repository for WorkflowExecution operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, WorkflowExecution)
+    
+    def get_by_execution_id(self, execution_id: str) -> Optional[WorkflowExecution]:
+        """Get execution by execution ID."""
+        return self.db.query(WorkflowExecution).filter(
+            WorkflowExecution.execution_id == execution_id
+        ).first()
+    
+    def get_user_executions(self, user_id: int, limit: int = 50) -> List[WorkflowExecution]:
+        """Get executions for a user."""
+        return self.db.query(WorkflowExecution).filter(
+            WorkflowExecution.user_id == user_id
+        ).order_by(desc(WorkflowExecution.created_at)).limit(limit).all()
+    
+    def get_by_status(self, status: str) -> List[WorkflowExecution]:
+        """Get executions by status."""
+        return self.db.query(WorkflowExecution).filter(
+            WorkflowExecution.status == status
+        ).all()
+    
+    def get_running_executions(self) -> List[WorkflowExecution]:
+        """Get currently running executions."""
+        return self.db.query(WorkflowExecution).filter(
+            WorkflowExecution.status.in_(["pending", "running"])
+        ).all()
+    
+    def update_status(self, execution_id: str, status: str, 
+                     error_message: str = None, output_data: Dict = None):
+        """Update execution status."""
+        execution = self.get_by_execution_id(execution_id)
+        if execution:
+            execution.status = status
+            execution.updated_at = datetime.utcnow()
+            
+            if status == "completed":
+                execution.completed_at = datetime.utcnow()
+                if execution.started_at:
+                    duration = execution.completed_at - execution.started_at
+                    execution.duration_ms = int(duration.total_seconds() * 1000)
+            
+            if error_message:
+                execution.error_message = error_message
+            
+            if output_data:
+                execution.output_data = output_data
+            
+            self.db.commit()
+        return execution
+    
+    def get_execution_stats(self, days: int = 30) -> Dict[str, Any]:
+        """Get execution statistics for the last N days."""
+        start_date = datetime.utcnow() - timedelta(days=days)
+        
+        total_executions = self.db.query(WorkflowExecution).filter(
+            WorkflowExecution.created_at >= start_date
+        ).count()
+        
+        successful_executions = self.db.query(WorkflowExecution).filter(
+            and_(
+                WorkflowExecution.created_at >= start_date,
+                WorkflowExecution.status == "completed"
+            )
+        ).count()
+        
+        failed_executions = self.db.query(WorkflowExecution).filter(
+            and_(
+                WorkflowExecution.created_at >= start_date,
+                WorkflowExecution.status == "failed"
+            )
+        ).count()
+        
+        return {
+            "total_executions": total_executions,
+            "successful_executions": successful_executions,
+            "failed_executions": failed_executions,
+            "success_rate": successful_executions / total_executions if total_executions > 0 else 0
+        }
+
+class SlackWorkspaceRepository(BaseRepository):
+    """Repository for SlackWorkspace operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, SlackWorkspace)
+    
+    def get_by_team_id(self, team_id: str) -> Optional[SlackWorkspace]:
+        """Get workspace by team ID."""
+        return self.db.query(SlackWorkspace).filter(
+            SlackWorkspace.team_id == team_id
+        ).first()
+    
+    def update_activity(self, team_id: str):
+        """Update workspace last activity."""
+        workspace = self.get_by_team_id(team_id)
+        if workspace:
+            workspace.last_active_at = datetime.utcnow()
+            self.db.commit()
+        return workspace
+    
+    def increment_usage(self, team_id: str):
+        """Increment daily API usage."""
+        workspace = self.get_by_team_id(team_id)
+        if workspace:
+            # Reset counter if it's a new day
+            if workspace.last_usage_reset.date() < datetime.utcnow().date():
+                workspace.current_daily_usage = 0
+                workspace.last_usage_reset = datetime.utcnow()
+            
+            workspace.current_daily_usage += 1
+            self.db.commit()
+        return workspace
+
+class APIKeyRepository(BaseRepository):
+    """Repository for API key operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, APIKey)
+    
+    def get_by_key_id(self, key_id: str) -> Optional[APIKey]:
+        """Get API key by key ID."""
+        return self.db.query(APIKey).filter(APIKey.key_id == key_id).first()
+    
+    def get_active_keys(self) -> List[APIKey]:
+        """Get all active API keys."""
+        now = datetime.utcnow()
+        return self.db.query(APIKey).filter(
+            and_(
+                APIKey.is_active == True,
+                or_(APIKey.expires_at.is_(None), APIKey.expires_at > now)
+            )
+        ).all()
+    
+    def update_usage(self, key_id: str):
+        """Update API key usage statistics."""
+        api_key = self.get_by_key_id(key_id)
+        if api_key:
+            # Reset hourly counter if needed
+            if api_key.last_hour_reset < datetime.utcnow() - timedelta(hours=1):
+                api_key.current_hour_requests = 0
+                api_key.last_hour_reset = datetime.utcnow()
+            
+            api_key.current_hour_requests += 1
+            api_key.total_requests += 1
+            api_key.last_used_at = datetime.utcnow()
+            self.db.commit()
+        return api_key
+
+class SystemMetricsRepository(BaseRepository):
+    """Repository for system metrics operations."""
+    
+    def __init__(self, db: Session):
+        super().__init__(db, SystemMetrics)
+    
+    def record_metric(self, name: str, value: int, metric_type: str = "counter", 
+                     tags: Dict[str, Any] = None):
+        """Record a system metric."""
+        metric = SystemMetrics(
+            metric_name=name,
+            metric_type=metric_type,
+            value=value,
+            tags=tags or {}
+        )
+        self.db.add(metric)
+        self.db.commit()
+        return metric
+    
+    def get_metrics_by_name(self, name: str, hours: int = 24) -> List[SystemMetrics]:
+        """Get metrics by name for the last N hours."""
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        return self.db.query(SystemMetrics).filter(
+            and_(
+                SystemMetrics.metric_name == name,
+                SystemMetrics.timestamp >= start_time
+            )
+        ).order_by(asc(SystemMetrics.timestamp)).all()
+    
+    def get_metric_summary(self, name: str, hours: int = 24) -> Dict[str, Any]:
+        """Get aggregated metric summary."""
+        metrics = self.get_metrics_by_name(name, hours)
+        if not metrics:
+            return {"count": 0, "sum": 0, "avg": 0, "min": 0, "max": 0}
+        
+        values = [m.value for m in metrics]
+        return {
+            "count": len(values),
+            "sum": sum(values),
+            "avg": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values)
+        }
+    
+    def cleanup_old_metrics(self, days: int = 30):
+        """Remove metrics older than specified days."""
+        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        self.db.query(SystemMetrics).filter(
+            SystemMetrics.timestamp < cutoff_date
+        ).delete()
+        self.db.commit()
