@@ -4,6 +4,7 @@ Monitoring and observability setup for the Notion-Slack AI Agent.
 import logging
 import os
 import time
+import asyncio
 from typing import Dict, Any, Optional
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 import structlog
