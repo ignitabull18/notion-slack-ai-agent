@@ -1,467 +1,415 @@
 """
-Authentication and authorization services.
+Authentication and authorization service for the Notion-Slack AI Agent.
 """
 import hashlib
 import secrets
+import hmac
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import Session
+from typing import Optional, Dict, Any, List
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from fastapi import HTTPException, status
-from fastapi.security import HTTPBearer
-import logging
+from sqlalchemy.orm import Session
 
-from src.models.database import get_db_session
-from src.models.models import APIKeyModel, UserMappingModel
-from src.models.repositories import user_mapping_repo
-from src.utils.errors import AuthenticationError, ValidationError
-from src.utils.helpers import mask_sensitive_data
 from src.config import get_settings
+from src.models.repositories import UserRepository, APIKeyRepository
+from src.models.schemas import User, APIKey
+from src.utils.errors import AuthenticationError, ValidationError
 
-logger = logging.getLogger(__name__)
+settings = get_settings()
+
+# Password hashing context
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT settings
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 class AuthService:
     """Authentication and authorization service."""
     
-    def __init__(self):
-        self.settings = get_settings()
+    def __init__(self, db: Session):
+        self.db = db
+        self.user_repo = UserRepository(db)
+        self.api_key_repo = APIKeyRepository(db)
     
-    def generate_api_key(self) -> tuple[str, str]:
+    def create_access_token(self, data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
         """
-        Generate a new API key.
-        
-        Returns:
-            Tuple of (key_id, api_key)
-        """
-        # Generate key ID (public identifier)
-        key_id = f"ak_{secrets.token_urlsafe(16)}"
-        
-        # Generate API key (secret)
-        api_key = f"sk_{secrets.token_urlsafe(32)}"
-        
-        return key_id, api_key
-    
-    def hash_api_key(self, api_key: str) -> str:
-        """
-        Hash an API key for secure storage.
+        Create JWT access token.
         
         Args:
-            api_key: The API key to hash
-            
+            data: Token payload data
+            expires_delta: Token expiration time
+        
         Returns:
-            Hashed API key
+            JWT token string
         """
-        return hashlib.sha256(api_key.encode()).hexdigest()
+        to_encode = data.copy()
+        if expires_delta:
+            expire = datetime.utcnow() + expires_delta
+        else:
+            expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+        to_encode.update({"exp": expire})
+        encoded_jwt = jwt.encode(to_encode, settings.api_secret_key, algorithm=ALGORITHM)
+        return encoded_jwt
     
-    def create_api_key(
-        self,
-        name: str,
-        description: str = "",
-        permissions: Optional[List[str]] = None,
-        rate_limit: int = 1000,
-        expires_in_days: Optional[int] = None,
-        created_by: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def verify_token(self, token: str) -> Dict[str, Any]:
         """
-        Create a new API key.
+        Verify JWT token and return payload.
         
         Args:
-            name: Name for the API key
-            description: Description of the API key
-            permissions: List of allowed operations
-            rate_limit: Requests per hour limit
-            expires_in_days: Expiration in days (None for no expiration)
-            created_by: User who created the key
-            
+            token: JWT token string
+        
         Returns:
-            Dictionary with key information
+            Token payload
+        
+        Raises:
+            AuthenticationError: If token is invalid
         """
         try:
-            key_id, api_key = self.generate_api_key()
-            key_hash = self.hash_api_key(api_key)
-            
-            expires_at = None
-            if expires_in_days:
-                expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
-            
-            db = get_db_session()
-            try:
-                api_key_model = APIKeyModel(
-                    key_id=key_id,
-                    key_hash=key_hash,
-                    name=name,
-                    description=description,
-                    permissions=permissions or [],
-                    rate_limit=rate_limit,
-                    created_by=created_by,
-                    expires_at=expires_at
-                )
-                
-                db.add(api_key_model)
-                db.commit()
-                db.refresh(api_key_model)
-                
-                logger.info(f"Created API key: {mask_sensitive_data(key_id)}")
-                
-                return {
-                    "key_id": key_id,
-                    "api_key": api_key,  # Only returned once!
-                    "name": name,
-                    "permissions": permissions or [],
-                    "rate_limit": rate_limit,
-                    "expires_at": expires_at.isoformat() if expires_at else None,
-                    "created_at": api_key_model.created_at.isoformat()
-                }
-            finally:
-                db.close()
-                
-        except Exception as e:
-            logger.error(f"Failed to create API key: {e}")
-            raise AuthenticationError(f"Failed to create API key: {e}")
+            payload = jwt.decode(token, settings.api_secret_key, algorithms=[ALGORITHM])
+            return payload
+        except JWTError:
+            raise AuthenticationError("Invalid token")
     
-    def validate_api_key(self, api_key: str) -> Optional[APIKeyModel]:
+    def authenticate_user(self, slack_user_id: str, slack_team_id: str) -> Optional[User]:
         """
-        Validate an API key and return the associated model.
-        
-        Args:
-            api_key: The API key to validate
-            
-        Returns:
-            APIKeyModel if valid, None otherwise
-        """
-        try:
-            key_hash = self.hash_api_key(api_key)
-            
-            db = get_db_session()
-            try:
-                api_key_model = db.query(APIKeyModel).filter(
-                    APIKeyModel.key_hash == key_hash,
-                    APIKeyModel.is_active == True
-                ).first()
-                
-                if not api_key_model:
-                    return None
-                
-                # Check expiration
-                if api_key_model.expires_at and api_key_model.expires_at < datetime.utcnow():
-                    logger.warning(f"Expired API key used: {mask_sensitive_data(api_key_model.key_id)}")
-                    return None
-                
-                # Update last used timestamp
-                api_key_model.last_used = datetime.utcnow()
-                db.commit()
-                
-                return api_key_model
-                
-            finally:
-                db.close()
-                
-        except Exception as e:
-            logger.error(f"Error validating API key: {e}")
-            return None
-    
-    def check_permission(self, api_key_model: APIKeyModel, required_permission: str) -> bool:
-        """
-        Check if an API key has the required permission.
-        
-        Args:
-            api_key_model: The API key model
-            required_permission: Required permission string
-            
-        Returns:
-            True if permission granted, False otherwise
-        """
-        # If no permissions are set, allow all (for backwards compatibility)
-        if not api_key_model.permissions:
-            return True
-        
-        # Check for wildcard permission
-        if "*" in api_key_model.permissions:
-            return True
-        
-        # Check for specific permission
-        return required_permission in api_key_model.permissions
-    
-    def revoke_api_key(self, key_id: str) -> bool:
-        """
-        Revoke an API key.
-        
-        Args:
-            key_id: The key ID to revoke
-            
-        Returns:
-            True if successfully revoked, False otherwise
-        """
-        try:
-            db = get_db_session()
-            try:
-                api_key_model = db.query(APIKeyModel).filter(
-                    APIKeyModel.key_id == key_id
-                ).first()
-                
-                if api_key_model:
-                    api_key_model.is_active = False
-                    db.commit()
-                    
-                    logger.info(f"Revoked API key: {mask_sensitive_data(key_id)}")
-                    return True
-                
-                return False
-                
-            finally:
-                db.close()
-                
-        except Exception as e:
-            logger.error(f"Failed to revoke API key {mask_sensitive_data(key_id)}: {e}")
-            return False
-    
-    def list_api_keys(self, created_by: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        List API keys (without the actual key values).
-        
-        Args:
-            created_by: Filter by creator (optional)
-            
-        Returns:
-            List of API key information
-        """
-        try:
-            db = get_db_session()
-            try:
-                query = db.query(APIKeyModel).filter(APIKeyModel.is_active == True)
-                
-                if created_by:
-                    query = query.filter(APIKeyModel.created_by == created_by)
-                
-                api_keys = query.all()
-                
-                return [
-                    {
-                        "key_id": key.key_id,
-                        "name": key.name,
-                        "description": key.description,
-                        "permissions": key.permissions,
-                        "rate_limit": key.rate_limit,
-                        "created_by": key.created_by,
-                        "created_at": key.created_at.isoformat(),
-                        "last_used": key.last_used.isoformat() if key.last_used else None,
-                        "expires_at": key.expires_at.isoformat() if key.expires_at else None
-                    }
-                    for key in api_keys
-                ]
-                
-            finally:
-                db.close()
-                
-        except Exception as e:
-            logger.error(f"Failed to list API keys: {e}")
-            return []
-
-class SlackAuthService:
-    """Slack-specific authentication service."""
-    
-    def __init__(self):
-        self.settings = get_settings()
-    
-    def verify_slack_request(
-        self, 
-        body: bytes, 
-        timestamp: str, 
-        signature: str
-    ) -> bool:
-        """
-        Verify Slack request signature.
-        
-        Args:
-            body: Request body
-            timestamp: Slack timestamp header
-            signature: Slack signature header
-            
-        Returns:
-            True if signature is valid, False otherwise
-        """
-        try:
-            import hmac
-            import hashlib
-            
-            # Check timestamp to prevent replay attacks
-            request_timestamp = int(timestamp)
-            current_timestamp = int(datetime.utcnow().timestamp())
-            
-            if abs(current_timestamp - request_timestamp) > 300:  # 5 minutes
-                logger.warning("Slack request timestamp too old")
-                return False
-            
-            # Verify signature
-            sig_basestring = f"v0:{timestamp}:{body.decode()}"
-            expected_signature = 'v0=' + hmac.new(
-                self.settings.slack_signing_secret.encode(),
-                sig_basestring.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            return hmac.compare_digest(signature, expected_signature)
-            
-        except Exception as e:
-            logger.error(f"Error verifying Slack request: {e}")
-            return False
-    
-    def get_or_create_user_mapping(
-        self, 
-        slack_user_id: str,
-        user_info: Optional[Dict[str, Any]] = None
-    ) -> Optional[UserMappingModel]:
-        """
-        Get or create user mapping for Slack user.
+        Authenticate user by Slack credentials.
         
         Args:
             slack_user_id: Slack user ID
-            user_info: Optional user information from Slack API
-            
+            slack_team_id: Slack team ID
+        
         Returns:
-            UserMappingModel or None
+            User object if authenticated, None otherwise
         """
-        try:
-            db = get_db_session()
-            try:
-                # Try to get existing mapping
-                user_mapping = user_mapping_repo.get_by_slack_user_id(db, slack_user_id)
-                
-                if user_mapping:
-                    # Update last seen
-                    user_mapping_repo.update_last_seen(db, slack_user_id)
-                    return user_mapping
-                
-                # Create new mapping if user_info is provided
-                if user_info:
-                    from src.models.schemas import UserMappingCreate
-                    
-                    create_data = UserMappingCreate(
-                        slack_user_id=slack_user_id,
-                        email=user_info.get("profile", {}).get("email"),
-                        display_name=user_info.get("real_name") or user_info.get("name"),
-                        preferences={}
-                    )
-                    
-                    user_mapping = user_mapping_repo.create(db, create_data)
-                    logger.info(f"Created user mapping for Slack user: {mask_sensitive_data(slack_user_id)}")
-                    return user_mapping
-                
-                return None
-                
-            finally:
-                db.close()
-                
-        except Exception as e:
-            logger.error(f"Error getting/creating user mapping: {e}")
-            return None
-
-class PermissionService:
-    """Permission management service."""
+        user = self.user_repo.get_by_slack_id(slack_user_id, slack_team_id)
+        if user and user.is_active:
+            # Update last seen timestamp
+            self.user_repo.update_last_seen(user.id)
+            return user
+        return None
     
-    # Define available permissions
-    PERMISSIONS = {
-        "agent.chat": "Chat with AI agent",
-        "agent.status": "View agent status",
-        "notion.read": "Read Notion data",
-        "notion.write": "Write to Notion",
-        "slack.read": "Read Slack data", 
-        "slack.write": "Send Slack messages",
-        "workflow.read": "View workflows",
-        "workflow.write": "Create/modify workflows",
-        "workflow.execute": "Execute workflows",
-        "admin.users": "Manage users",
-        "admin.keys": "Manage API keys",
-        "admin.system": "System administration"
-    }
-    
-    @classmethod
-    def get_all_permissions(cls) -> Dict[str, str]:
-        """Get all available permissions."""
-        return cls.PERMISSIONS.copy()
-    
-    @classmethod
-    def validate_permissions(cls, permissions: List[str]) -> List[str]:
+    def create_user_token(self, user: User) -> str:
         """
-        Validate a list of permissions.
+        Create access token for user.
         
         Args:
-            permissions: List of permission strings
-            
-        Returns:
-            List of valid permissions
-            
-        Raises:
-            ValidationError: If invalid permissions found
-        """
-        invalid_permissions = [p for p in permissions if p not in cls.PERMISSIONS and p != "*"]
+            user: User object
         
-        if invalid_permissions:
-            raise ValidationError(
-                f"Invalid permissions: {invalid_permissions}",
-                field="permissions"
-            )
+        Returns:
+            JWT token string
+        """
+        token_data = {
+            "sub": str(user.id),
+            "slack_user_id": user.slack_user_id,
+            "slack_team_id": user.slack_team_id,
+            "is_admin": user.is_admin
+        }
+        return self.create_access_token(token_data)
+    
+    def get_current_user(self, token: str) -> User:
+        """
+        Get current user from token.
+        
+        Args:
+            token: JWT token string
+        
+        Returns:
+            User object
+        
+        Raises:
+            AuthenticationError: If user not found or inactive
+        """
+        try:
+            payload = self.verify_token(token)
+            user_id = int(payload.get("sub"))
+            if user_id is None:
+                raise AuthenticationError("Invalid token payload")
+        except (JWTError, ValueError):
+            raise AuthenticationError("Invalid token")
+        
+        user = self.user_repo.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise AuthenticationError("User not found or inactive")
+        
+        return user
+    
+    def create_api_key(self, name: str, created_by_user_id: int, 
+                      scopes: List[str] = None, 
+                      rate_limit_per_hour: int = 1000,
+                      expires_days: int = None) -> Dict[str, str]:
+        """
+        Create new API key.
+        
+        Args:
+            name: API key name
+            created_by_user_id: ID of user creating the key
+            scopes: List of allowed scopes
+            rate_limit_per_hour: Hourly rate limit
+            expires_days: Days until expiration (None for no expiration)
+        
+        Returns:
+            Dictionary with key_id and api_key
+        """
+        # Generate API key
+        api_key = f"agno_{secrets.token_urlsafe(32)}"
+        key_id = secrets.token_urlsafe(16)
+        
+        # Hash the API key for storage
+        key_hash = self._hash_api_key(api_key)
+        
+        # Calculate expiration
+        expires_at = None
+        if expires_days:
+            expires_at = datetime.utcnow() + timedelta(days=expires_days)
+        
+        # Create API key record
+        api_key_record = APIKey(
+            key_id=key_id,
+            key_hash=key_hash,
+            name=name,
+            created_by_user_id=created_by_user_id,
+            scopes=scopes or [],
+            rate_limit_per_hour=rate_limit_per_hour,
+            expires_at=expires_at
+        )
+        
+        self.db.add(api_key_record)
+        self.db.commit()
+        
+        return {
+            "key_id": key_id,
+            "api_key": api_key
+        }
+    
+    def authenticate_api_key(self, api_key: str) -> Optional[APIKey]:
+        """
+        Authenticate API key.
+        
+        Args:
+            api_key: API key string
+        
+        Returns:
+            APIKey object if valid, None otherwise
+        """
+        # Extract key ID from API key
+        if not api_key.startswith("agno_"):
+            return None
+        
+        # Hash the provided key
+        key_hash = self._hash_api_key(api_key)
+        
+        # Find matching API key
+        api_key_record = self.db.query(APIKey).filter(
+            APIKey.key_hash == key_hash,
+            APIKey.is_active == True
+        ).first()
+        
+        if not api_key_record:
+            return None
+        
+        # Check expiration
+        if api_key_record.expires_at and api_key_record.expires_at < datetime.utcnow():
+            return None
+        
+        # Update usage statistics
+        self.api_key_repo.update_usage(api_key_record.key_id)
+        
+        return api_key_record
+    
+    def check_api_key_permissions(self, api_key: APIKey, required_scope: str) -> bool:
+        """
+        Check if API key has required permissions.
+        
+        Args:
+            api_key: APIKey object
+            required_scope: Required scope/permission
+        
+        Returns:
+            True if authorized, False otherwise
+        """
+        if not api_key.scopes:
+            # No scopes means full access (for backwards compatibility)
+            return True
+        
+        return required_scope in api_key.scopes or "admin" in api_key.scopes
+    
+    def check_rate_limit(self, api_key: APIKey) -> bool:
+        """
+        Check if API key is within rate limits.
+        
+        Args:
+            api_key: APIKey object
+        
+        Returns:
+            True if within limits, False otherwise
+        """
+        return api_key.current_hour_requests < api_key.rate_limit_per_hour
+    
+    def revoke_api_key(self, key_id: str, user_id: int) -> bool:
+        """
+        Revoke API key.
+        
+        Args:
+            key_id: API key ID to revoke
+            user_id: ID of user requesting revocation
+        
+        Returns:
+            True if revoked successfully, False otherwise
+        """
+        api_key = self.api_key_repo.get_by_key_id(key_id)
+        if not api_key:
+            return False
+        
+        # Check if user has permission to revoke
+        user = self.user_repo.get_by_id(user_id)
+        if not user:
+            return False
+        
+        if api_key.created_by_user_id != user_id and not user.is_admin:
+            return False
+        
+        # Revoke the key
+        api_key.is_active = False
+        api_key.updated_at = datetime.utcnow()
+        self.db.commit()
+        
+        return True
+    
+    def verify_slack_signature(self, body: bytes, timestamp: str, signature: str) -> bool:
+        """
+        Verify Slack webhook signature.
+        
+        Args:
+            body: Request body bytes
+            timestamp: Request timestamp
+            signature: Slack signature header
+        
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        # Check timestamp to prevent replay attacks
+        request_time = int(timestamp)
+        current_time = int(datetime.utcnow().timestamp())
+        
+        if abs(current_time - request_time) > 60 * 5:  # 5 minutes
+            return False
+        
+        # Create signature base string
+        sig_basestring = f"v0:{timestamp}:{body.decode()}"
+        
+        # Calculate expected signature
+        expected_signature = 'v0=' + hmac.new(
+            settings.slack_signing_secret.encode(),
+            sig_basestring.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Compare signatures
+        return hmac.compare_digest(signature, expected_signature)
+    
+    def verify_notion_signature(self, body: bytes, signature: str) -> bool:
+        """
+        Verify Notion webhook signature.
+        
+        Args:
+            body: Request body bytes
+            signature: Notion signature header
+        
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        expected_signature = hmac.new(
+            settings.notion_webhook_secret.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(signature, expected_signature)
+    
+    def _hash_api_key(self, api_key: str) -> str:
+        """Hash API key for secure storage."""
+        return hashlib.sha256(api_key.encode()).hexdigest()
+    
+    def get_user_permissions(self, user: User) -> List[str]:
+        """
+        Get user permissions/scopes.
+        
+        Args:
+            user: User object
+        
+        Returns:
+            List of permission scopes
+        """
+        permissions = ["user"]  # Base permission
+        
+        if user.is_admin:
+            permissions.extend(["admin", "manage_users", "manage_api_keys"])
+        
+        # Add more granular permissions based on user roles/preferences
+        permissions.extend([
+            "notion:read", "notion:write",
+            "slack:read", "slack:write",
+            "workflows:execute"
+        ])
         
         return permissions
 
-# Service instances
-auth_service = AuthService()
-slack_auth_service = SlackAuthService()
-permission_service = PermissionService()
+class RoleBasedAccessControl:
+    """Role-based access control utilities."""
+    
+    # Define permission scopes
+    SCOPES = {
+        "user": "Basic user access",
+        "admin": "Administrative access",
+        "notion:read": "Read Notion data",
+        "notion:write": "Write Notion data", 
+        "slack:read": "Read Slack data",
+        "slack:write": "Write Slack data",
+        "workflows:execute": "Execute workflows",
+        "api:manage": "Manage API keys",
+        "users:manage": "Manage users",
+        "metrics:read": "Read system metrics"
+    }
+    
+    # Define role hierarchies
+    ROLES = {
+        "user": ["user", "notion:read", "slack:read"],
+        "power_user": ["user", "notion:read", "notion:write", "slack:read", "slack:write", "workflows:execute"],
+        "admin": ["admin"] + list(SCOPES.keys())
+    }
+    
+    @classmethod
+    def get_role_permissions(cls, role: str) -> List[str]:
+        """Get permissions for a role."""
+        return cls.ROLES.get(role, [])
+    
+    @classmethod
+    def has_permission(cls, user_permissions: List[str], required_permission: str) -> bool:
+        """Check if user has required permission."""
+        return required_permission in user_permissions or "admin" in user_permissions
+    
+    @classmethod
+    def require_permission(cls, required_permission: str):
+        """Decorator to require specific permission."""
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                # This would be implemented with FastAPI dependencies
+                # For now, it's a placeholder
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
-# Security dependencies for FastAPI
-security = HTTPBearer()
+def get_password_hash(password: str) -> str:
+    """Hash password using bcrypt."""
+    return pwd_context.hash(password)
 
-def get_current_api_key(api_key: str) -> APIKeyModel:
-    """
-    FastAPI dependency to get current API key.
-    
-    Args:
-        api_key: API key from Authorization header
-        
-    Returns:
-        APIKeyModel
-        
-    Raises:
-        HTTPException: If authentication fails
-    """
-    if not api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API key required"
-        )
-    
-    api_key_model = auth_service.validate_api_key(api_key)
-    if not api_key_model:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key"
-        )
-    
-    return api_key_model
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password against hash."""
+    return pwd_context.verify(plain_password, hashed_password)
 
-def require_permission(permission: str):
-    """
-    FastAPI dependency factory for permission checking.
-    
-    Args:
-        permission: Required permission string
-        
-    Returns:
-        Dependency function
-    """
-    def check_permission(api_key_model: APIKeyModel = None) -> APIKeyModel:
-        if not api_key_model:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required"
-            )
-        
-        if not auth_service.check_permission(api_key_model, permission):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission required: {permission}"
-            )
-        
-        return api_key_model
-    
-    return check_permission
+def generate_secure_token(length: int = 32) -> str:
+    """Generate cryptographically secure random token."""
+    return secrets.token_urlsafe(length)
