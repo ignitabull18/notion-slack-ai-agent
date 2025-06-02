@@ -2,41 +2,37 @@
 Database models and schemas for the Notion-Slack AI Agent.
 """
 
-from .database import Base, get_db
+from .database import Base, engine, SessionLocal, get_db
 from .schemas import (
-    AgentSessionCreate,
-    AgentSessionUpdate, 
     AgentSession,
-    WorkflowConfigCreate,
-    WorkflowConfigUpdate,
-    WorkflowConfig,
-    EventLogCreate,
-    EventLog,
-    UserMappingCreate,
-    UserMapping
+    NotionDatabase,
+    SlackWorkspace,
+    WorkflowExecution,
+    User,
+    UserPreferences
 )
 from .repositories import (
     AgentSessionRepository,
-    WorkflowConfigRepository,
-    EventLogRepository,
-    UserMappingRepository
+    NotionDatabaseRepository,
+    SlackWorkspaceRepository,
+    WorkflowExecutionRepository,
+    UserRepository
 )
 
 __all__ = [
     "Base",
+    "engine", 
+    "SessionLocal",
     "get_db",
-    "AgentSessionCreate",
-    "AgentSessionUpdate", 
     "AgentSession",
-    "WorkflowConfigCreate",
-    "WorkflowConfigUpdate",
-    "WorkflowConfig",
-    "EventLogCreate",
-    "EventLog",
-    "UserMappingCreate",
-    "UserMapping",
+    "NotionDatabase", 
+    "SlackWorkspace",
+    "WorkflowExecution",
+    "User",
+    "UserPreferences",
     "AgentSessionRepository",
-    "WorkflowConfigRepository",
-    "EventLogRepository",
-    "UserMappingRepository"
+    "NotionDatabaseRepository",
+    "SlackWorkspaceRepository", 
+    "WorkflowExecutionRepository",
+    "UserRepository"
 ]
