@@ -1,0 +1,257 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: notion-slack-agent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: notion-slack-agent
+data:
+  LOG_LEVEL: "INFO"
+  ENVIRONMENT: "production"
+  PROMETHEUS_ENABLED: "true"
+  PROMETHEUS_PORT: "9090"
+  DEBUG: "false"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-secrets
+  namespace: notion-slack-agent
+type: Opaque
+data:
+  # Base64 encoded secrets - replace with actual values
+  OPENAI_API_KEY: "base64_encoded_openai_key"
+  NOTION_INTEGRATION_TOKEN: "base64_encoded_notion_token"
+  SLACK_BOT_TOKEN: "base64_encoded_slack_token"
+  SLACK_SIGNING_SECRET: "base64_encoded_slack_secret"
+  NOTION_WEBHOOK_SECRET: "base64_encoded_notion_webhook_secret"
+  API_SECRET_KEY: "base64_encoded_api_secret_key"
+  DATABASE_URL: "base64_encoded_database_url"
+  REDIS_URL: "base64_encoded_redis_url"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notion-slack-agent
+  namespace: notion-slack-agent
+  labels:
+    app: notion-slack-agent
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: notion-slack-agent
+  template:
+    metadata:
+      labels:
+        app: notion-slack-agent
+    spec:
+      containers:
+      - name: agent
+        image: notion-slack-agent:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: PORT
+          value: "8000"
+        envFrom:
+        - configMapRef:
+            name: agent-config
+        - secretRef:
+            name: agent-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notion-slack-agent-service
+  namespace: notion-slack-agent
+  labels:
+    app: notion-slack-agent
+spec:
+  selector:
+    app: notion-slack-agent
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notion-slack-agent-ingress
+  namespace: notion-slack-agent
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  tls:
+  - hosts:
+    - your-domain.com
+    secretName: agent-tls-secret
+  rules:
+  - host: your-domain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: notion-slack-agent-service
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notion-slack-agent-metrics
+  namespace: notion-slack-agent
+  labels:
+    app: notion-slack-agent
+    service: metrics
+spec:
+  selector:
+    app: notion-slack-agent
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: notion-slack-agent-monitor
+  namespace: notion-slack-agent
+  labels:
+    app: notion-slack-agent
+spec:
+  selector:
+    matchLabels:
+      service: metrics
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: notion-slack-agent-pdb
+  namespace: notion-slack-agent
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: notion-slack-agent
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: notion-slack-agent-hpa
+  namespace: notion-slack-agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: notion-slack-agent
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notion-slack-agent-sa
+  namespace: notion-slack-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: notion-slack-agent
+  name: notion-slack-agent-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notion-slack-agent-binding
+  namespace: notion-slack-agent
+subjects:
+- kind: ServiceAccount
+  name: notion-slack-agent-sa
+  namespace: notion-slack-agent
+roleRef:
+  kind: Role
+  name: notion-slack-agent-role
+  apiGroup: rbac.authorization.k8s.io
